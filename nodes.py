@@ -36,6 +36,7 @@ class Gemma3ModelLoader:
             },
             "optional": {
                 "local_gemma3_model_path": (gguf_models, {"default": gguf_models[0]}),
+                "n_gpu_layers": ("INT", {"default": -1, "min": -1, "max": 100, "step": 1}),
             }
         }
 
@@ -58,9 +59,11 @@ class Gemma3ModelLoader:
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"GGUF 模型文件不存在: {model_path}")
 
+            n_gpu_layers = kwargs.get("n_gpu_layers", -1)
+
             model = Llama(
                 model_path=model_path,
-                n_gpu_layers=-1,
+                n_gpu_layers=n_gpu_layers,
                 n_ctx=128000,
                 verbose=False
             )
