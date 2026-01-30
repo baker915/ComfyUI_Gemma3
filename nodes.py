@@ -15,15 +15,27 @@ def tensor2pil(image):
 class Gemma3ModelLoader:
     @classmethod
     def INPUT_TYPES(s):
+        gemma_dir = os.path.join(folder_paths.models_dir, "Gemma3")
+        gguf_models = []
+
+        if os.path.exists(gemma_dir):
+            for file in os.listdir(gemma_dir):
+                if file.endswith('.gguf'):
+                    gguf_models.append(file)
+
+        if not gguf_models:
+            gguf_models = ["no_gguf_models_found"]
+
         return {
             "required": {
                 "model_id": (
                 ["google/gemma-3-27b-it", "google/gemma-3-12b-it", "google/gemma-3-1b-it", "google/gemma-3-4b-it"],
                 {"default": "google/gemma-3-27b-it"}),
                 "load_local_model": ("BOOLEAN", {"default": False}),
+                "use_gguf": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "local_gemma3_model_path": ("STRING", {"default": "google/gemma-3-27b-it"}),
+                "local_gemma3_model_path": (gguf_models, {"default": gguf_models[0]}),
             }
         }
 
@@ -32,17 +44,35 @@ class Gemma3ModelLoader:
     FUNCTION = "load_model"
     CATEGORY = "gemma3"
 
-    def load_model(self, model_id, load_local_model, *args, **kwargs):
+    def load_model(self, model_id, load_local_model, use_gguf, *args, **kwargs):
+        if use_gguf:
+            try:
+                from llama_cpp import Llama
+            except ImportError:
+                raise ImportError("需要安装 llama-cpp-python: pip install llama-cpp-python")
+
+            gemma_dir = os.path.join(folder_paths.models_dir, "Gemma3")
+            model_filename = kwargs.get("local_gemma3_model_path", "gemma-3-27b-it-Q4_K_M.gguf")
+            model_path = os.path.join(gemma_dir, model_filename)
+
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"GGUF 模型文件不存在: {model_path}")
+
+            model = Llama(
+                model_path=model_path,
+                n_gpu_layers=-1,
+                n_ctx=128000,
+                verbose=False
+            )
+            return (model, None)
+
         device = mm.get_torch_device()
         if load_local_model:
-            # 如果加载本地模型，直接使用用户提供的路径
             model_id = kwargs.get("local_gemma3_model_path", model_id)
         else:
-            # 如果加载 Hugging Face 模型，下载到 ComfyUI 的模型目录
             gemma_dir = os.path.join(folder_paths.models_dir, "Gemma3")
             os.makedirs(gemma_dir, exist_ok=True)
 
-            # 下载模型到指定目录
             model = Gemma3ForConditionalGeneration.from_pretrained(
                 model_id, cache_dir=gemma_dir, device_map="auto"
             ).eval().to(device)
@@ -51,7 +81,6 @@ class Gemma3ModelLoader:
             )
             return (model, processor)
 
-        # 加载本地模型
         model = Gemma3ForConditionalGeneration.from_pretrained(
             model_id, device_map="auto"
         ).eval().to(device)
@@ -66,45 +95,52 @@ class ApplyGemma3:
             "required": {
                 "model": ("MODEL",),
                 "processor": ("PROCESSOR",),
-                "prompt": ("STRING", {"default": "Describe this image in detail."}),
-                "max_new_tokens": ("INT", {"default": 100, "min": 1, "max": 1000}),
+                "max_new_tokens": ("INT", {"default": 100, "min": 1, "max": 65536}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1}),
+                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "do_sample": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "image": ("IMAGE",),  # 图像输入作为可选项
+                "system_prompt": ("STRING", {"default": "You are a helpful assistant.", "multiline": True}),
+                "user_prompt": ("STRING", {"default": "Describe this image in detail.", "multiline": True}),
+                "image": ("IMAGE",),
             }
         }
 
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("description",)
+    RETURN_NAMES = ("output",)
     FUNCTION = "apply_gemma3"
     CATEGORY = "gemma3"
 
-    def apply_gemma3(self, model, processor, prompt, max_new_tokens, image=None):
+    def apply_gemma3(self, model, processor, max_new_tokens, temperature, top_p, do_sample, system_prompt=None, user_prompt=None, image=None):
+        if processor is None:
+            return self._apply_gguf(model, system_prompt, user_prompt, max_new_tokens, temperature, top_p, do_sample, image)
+        else:
+            return self._apply_transformers(model, processor, system_prompt, user_prompt, max_new_tokens, temperature, top_p, do_sample, image)
+
+    def _apply_transformers(self, model, processor, system_prompt, user_prompt, max_new_tokens, temperature, top_p, do_sample, image=None):
         messages = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": "You are a helpful assistant."}]
+                "content": [{"type": "text", "text": system_prompt}]
             }
         ]
 
-        # 如果有图像输入，将图像和提示添加到消息中
         if image is not None:
-            image_pil = tensor2pil(image)  # 将 ComfyUI 的 IMAGE 格式转换为 PIL.Image
+            image_pil = tensor2pil(image)
             messages.append({
                 "role": "user",
                 "content": [
                     {"type": "image", "image": image_pil},
-                    {"type": "text", "text": prompt}
+                    {"type": "text", "text": user_prompt}
                 ]
             })
         else:
-            # 如果没有图像输入，仅使用文本提示
             messages.append({
                 "role": "user",
-                "content": [{"type": "text", "text": prompt}]
+                "content": [{"type": "text", "text": user_prompt}]
             })
 
-        # 处理输入
         inputs = processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors="pt"
@@ -112,13 +148,34 @@ class ApplyGemma3:
 
         input_len = inputs["input_ids"].shape[-1]
 
-        # 生成文本
         with torch.inference_mode():
-            generation = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            generation = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p
+            )
             generation = generation[0][input_len:]
 
         decoded = processor.decode(generation, skip_special_tokens=True)
         return (decoded,)
+
+    def _apply_gguf(self, model, system_prompt, user_prompt, max_new_tokens, temperature, top_p, do_sample, image=None):
+        if image is not None:
+            raise NotImplementedError("GGUF 模型暂不支持图像输入，请使用纯文本推理")
+
+        full_prompt = f"<|system|>\n{system_prompt}\n<|user|>\n{user_prompt}\n<|model|>\n"
+
+        output = model(
+            full_prompt,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            echo=False
+        )
+
+        return (output['choices'][0]['text'],)
 
 
 NODE_CLASS_MAPPINGS = {
